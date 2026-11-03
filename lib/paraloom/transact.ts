@@ -17,7 +17,7 @@ import {
   type Keypair
 } from "@solana/web3.js"
 
-import { v3NoteCommitment } from "~lib/prover"
+import { assetIdForMint, v3NoteCommitment, v3NoteCommitmentAsset } from "~lib/prover"
 
 import { base58Decode, confirmBySignatureStatus } from "./bridge"
 import {
@@ -25,9 +25,11 @@ import {
   BRIDGE_VAULT_SEED,
   DEPOSIT_NOTE_DISCRIMINATOR,
   DEPOSIT_NOTE_EVENT_DISCRIMINATOR,
+  DEPOSIT_NOTE_SPL_DISCRIMINATOR,
   DEPOSIT_NOTE_SPL_EVENT_DISCRIMINATOR,
   MERKLE_TREE_SEED,
   PROGRAM_ID,
+  TRANSACT_DISCRIMINATOR,
   TRANSACT_EVENT_DISCRIMINATOR,
   TRANSACT_INGRESS_URL
 } from "./constants"
@@ -157,7 +159,14 @@ function startsWith(buf: Uint8Array, prefix: Uint8Array): boolean {
 interface InstructionLike {
   programId?: { toBase58(): string }
   programIdIndex?: number
+  accounts?: number[]
+  keys?: { pubkey: { toBase58(): string } }[]
   data: string | Uint8Array
+}
+
+interface InnerInstructionsLike {
+  index: number
+  instructions: InstructionLike[]
 }
 
 interface MessageLike {
@@ -167,44 +176,119 @@ interface MessageLike {
   instructions?: InstructionLike[]
 }
 
+interface TruncatedTxLike {
+  transaction?: { message?: unknown }
+  meta?: {
+    innerInstructions?: InnerInstructionsLike[]
+    loadedAddresses?: {
+      writable?: { toBase58(): string }[]
+      readonly?: { toBase58(): string }[]
+    }
+  }
+}
+
 /**
- * Recover the deposit commitments from a transaction whose logs were truncated.
+ * Recover every leaf appended by a transaction whose logs were truncated.
  *
  * Solana caps a transaction's logs at 10,000 bytes and replaces the tail with a
- * single `Log truncated` line. A `deposit_note` after that line still commits
- * its leaf on-chain but its DepositNoteEvent is gone, so the log-only rebuild
- * loses a leaf and every later spend fails the contiguity/root check.
+ * single `Log truncated` line. Leaf-producing instructions after that line
+ * still commit on-chain but their events are gone. The instruction data carries
+ * everything needed:
  *
- * The instruction data carries the same amount/pubkey/blinding the program used
- * to build the commitment, so deposit leaves can be reconstructed without the
- * event. Transact outputs are not recovered here; if one is missing the final
- * contiguity check refuses the tree instead of folding a wrong root.
+ * - `deposit_note`: amount | pubkey | blinding → v3NoteCommitment.
+ * - `deposit_note_spl`: same args; mint account (index 2) → asset-bound
+ *   v3NoteCommitmentAsset.
+ * - `transact`: output_commitments[2] directly (disc 8 | nullifiers 64 |
+ *   output_commitments 64 | root 32 | ext_amount 8 | proof vec).
+ *
+ * This walks top-level instructions AND CPI inner instructions, because
+ * `deposit_note` has no stack-height restriction: an attacker can log 10 KB and
+ * then CPI into it precisely to hide the leaf from a top-level-only reader.
  */
-async function depositCommitmentsFromTx(tx: {
-  transaction?: { message?: unknown }
-}): Promise<string[]> {
+async function leafCommitmentsFromTruncatedTx(tx: TruncatedTxLike): Promise<string[]> {
   const msg = tx.transaction?.message as MessageLike | undefined
   if (!msg) return []
-  const keys = msg.staticAccountKeys ?? msg.accountKeys ?? []
-  const ixs = msg.compiledInstructions ?? msg.instructions ?? []
+  const keys = [
+    ...(msg.staticAccountKeys ?? msg.accountKeys ?? []),
+    ...(tx.meta?.loadedAddresses?.writable ?? []),
+    ...(tx.meta?.loadedAddresses?.readonly ?? [])
+  ]
+  const topLevel = msg.compiledInstructions ?? msg.instructions ?? []
+  const inner = tx.meta?.innerInstructions ?? []
   const commitments: string[] = []
-  for (const ix of ixs) {
+
+  const collect = async (ix: InstructionLike) => {
     const pid =
       ix.programId?.toBase58() ??
       (typeof ix.programIdIndex === "number"
         ? keys[ix.programIdIndex]?.toBase58()
         : undefined)
-    if (pid !== PROGRAM_ID) continue
+    if (pid !== PROGRAM_ID) return
     const data =
       typeof ix.data === "string" ? base58Decode(ix.data) : Uint8Array.from(ix.data)
-    if (data.length < 80 || !startsWith(data, DEPOSIT_NOTE_DISCRIMINATOR)) continue
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
-    const amount = view.getBigUint64(8, true)
-    const pubkeyHex = Buffer.from(data.slice(16, 48)).toString("hex")
-    const blindingHex = Buffer.from(data.slice(48, 80)).toString("hex")
-    commitments.push(
-      Buffer.from(await v3NoteCommitment(amount, pubkeyHex, blindingHex)).toString("hex")
-    )
+
+    if (startsWith(data, DEPOSIT_NOTE_DISCRIMINATOR) && data.length >= 80) {
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+      commitments.push(
+        Buffer.from(
+          await v3NoteCommitment(
+            view.getBigUint64(8, true),
+            Buffer.from(data.slice(16, 48)).toString("hex"),
+            Buffer.from(data.slice(48, 80)).toString("hex")
+          )
+        ).toString("hex")
+      )
+      return
+    }
+
+    if (startsWith(data, DEPOSIT_NOTE_SPL_DISCRIMINATOR) && data.length >= 80) {
+      const accounts =
+        ix.accounts?.map((i) => keys[i]) ??
+        ix.keys?.map((k) => k.pubkey) ??
+        []
+      const mint = accounts[2]
+      if (!mint) {
+        throw new Error(
+          "log-truncated deposit_note_spl is missing its mint account; " +
+            "cannot rebuild the asset-bound commitment"
+        )
+      }
+      const assetIdHex = await assetIdForMint(mint.toBase58())
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+      commitments.push(
+        Buffer.from(
+          await v3NoteCommitmentAsset(
+            view.getBigUint64(8, true),
+            Buffer.from(data.slice(16, 48)).toString("hex"),
+            Buffer.from(data.slice(48, 80)).toString("hex"),
+            assetIdHex
+          )
+        ).toString("hex")
+      )
+      return
+    }
+
+    if (startsWith(data, TRANSACT_DISCRIMINATOR) && data.length >= 176) {
+      // disc(8) | nullifiers(64) | output_commitments(64) | root(32) | ...
+      commitments.push(Buffer.from(data.slice(72, 104)).toString("hex"))
+      commitments.push(Buffer.from(data.slice(104, 136)).toString("hex"))
+    }
+  }
+
+  for (let i = 0; i < topLevel.length; i++) {
+    await collect(topLevel[i])
+    for (const group of inner) {
+      if (group.index !== i) continue
+      for (const ix of group.instructions) await collect(ix)
+    }
+  }
+  // Defensive: an inner group whose top-level index is out of range still
+  // belongs to this transaction; process it rather than silently dropping a
+  // possible leaf.
+  for (const group of inner) {
+    if (group.index >= topLevel.length) {
+      for (const ix of group.instructions) await collect(ix)
+    }
   }
   return commitments
 }
@@ -299,20 +383,23 @@ export async function fetchV3Leaves(connection: Connection): Promise<V3Leaf[]> {
         const body = payload.slice(8)
         const oc0 = body.slice(64, 96)
         const oc1 = body.slice(96, 128)
+        const oc0Hex = Buffer.from(oc0).toString("hex")
+        const oc1Hex = Buffer.from(oc1).toString("hex")
         const base = transactLeafCursor ?? leaves.length
-        leaves.push({ index: base, commitmentHex: Buffer.from(oc0).toString("hex") })
-        leaves.push({ index: base + 1, commitmentHex: Buffer.from(oc1).toString("hex") })
+        eventCommitments.add(oc0Hex)
+        eventCommitments.add(oc1Hex)
+        leaves.push({ index: base, commitmentHex: oc0Hex })
+        leaves.push({ index: base + 1, commitmentHex: oc1Hex })
         transactLeafCursor = base + 2
         nextLeafIndex = Math.max(nextLeafIndex, base + 2)
       }
     }
     if (truncated) {
-      // The log tail is gone, so any deposit after the truncation point has no
-      // DepositNoteEvent. Reconstruct those commitments from the instruction
-      // itself and place them at the next append position. A truncated transact
-      // output is not recoverable here; the contiguity check below then refuses
-      // the incomplete tree instead of folding a wrong root.
-      for (const commitmentHex of await depositCommitmentsFromTx(tx)) {
+      // The log tail is gone, so any leaf-producing instruction after the
+      // truncation point has no event. Recover every kind from the instruction
+      // data — top-level and CPI inner, deposit and transact — and append only
+      // the ones a surviving event did not already record.
+      for (const commitmentHex of await leafCommitmentsFromTruncatedTx(tx)) {
         if (eventCommitments.has(commitmentHex)) continue
         leaves.push({ index: nextLeafIndex, commitmentHex })
         transactLeafCursor = Math.max(transactLeafCursor ?? 0, nextLeafIndex + 1)
