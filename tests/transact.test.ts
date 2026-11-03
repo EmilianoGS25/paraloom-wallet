@@ -7,6 +7,7 @@
 import { sha256 } from "@noble/hashes/sha256"
 import type { Connection } from "@solana/web3.js"
 import {
+  DEPOSIT_NOTE_DISCRIMINATOR,
   DEPOSIT_NOTE_EVENT_DISCRIMINATOR,
   DEPOSIT_NOTE_SPL_EVENT_DISCRIMINATOR,
   PROGRAM_ID,
@@ -15,9 +16,12 @@ import {
 import { fetchV3Leaves } from "~lib/paraloom/transact"
 import { describe, expect, it, vi } from "vitest"
 
-// transact.ts now reaches ~lib/prover through bridge.ts, and the wasm module
-// cannot load under vitest. Nothing in fetchV3Leaves uses it.
-vi.mock("~lib/prover", () => ({ NATIVE_ASSET_HEX: "00".repeat(32) }))
+// transact.ts reaches ~lib/prover for the truncated-log deposit fallback, and
+// the wasm module cannot load under vitest.
+vi.mock("~lib/prover", () => ({
+  NATIVE_ASSET_HEX: "00".repeat(32),
+  v3NoteCommitment: vi.fn(async () => new Uint8Array(32).fill(0xb0))
+}))
 
 const OTHER_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
@@ -92,6 +96,8 @@ interface FakeTx {
   err?: unknown
   /** Number of leading getTransaction calls that return null. */
   nullFor?: number
+  /** Instruction data used by the log-truncation fallback. */
+  transaction?: { message: { instructions: unknown[] } }
 }
 
 function fakeConnection(txs: FakeTx[]) {
@@ -117,7 +123,10 @@ function fakeConnection(txs: FakeTx[]) {
         nullsLeft.set(signature, remaining - 1)
         return null
       }
-      return { meta: { logMessages: txs[Number(signature.slice(3))].logs ?? [] } }
+      return {
+        meta: { logMessages: txs[Number(signature.slice(3))].logs ?? [] },
+        transaction: txs[Number(signature.slice(3))].transaction
+      }
     }
   }
   return { connection: connection as unknown as Connection, calls }
@@ -147,6 +156,37 @@ describe("event attribution", () => {
     const leaves = await fetchV3Leaves(connection)
     expect(leaves.map((l) => l.index)).toEqual([0, 1])
     expect(leaves[0].commitmentHex).toBe("a0".repeat(32))
+  })
+
+  it("recovers a deposit whose event was lost to log truncation", async () => {
+    // Solana caps a tx at 10,000 log bytes and replaces the tail with
+    // `Log truncated`. The deposit after that point still appends a leaf, but
+    // its DepositNoteEvent is gone; the instruction data has the same
+    // amount/pubkey/blinding and can rebuild the commitment (#54).
+    const truncatedLogs = [
+      `Program ${PROGRAM_ID} invoke [1]`,
+      ...Array.from({ length: 300 }, (_, i) => `Program log: filler ${i}`),
+      "Log truncated",
+      `Program ${PROGRAM_ID} success`
+    ]
+    const data = new Uint8Array(80)
+    data.set(DEPOSIT_NOTE_DISCRIMINATOR, 0)
+    new DataView(data.buffer).setBigUint64(8, 1n, true)
+    data.fill(0x11, 16, 48)
+    data.fill(0x22, 48, 80)
+    const depositIx = {
+      programId: { toBase58: () => PROGRAM_ID },
+      data: Buffer.from(data)
+    }
+
+    const { connection } = fakeConnection([
+      { logs: emittedBy(PROGRAM_ID, depositEvent(0xa0, 0)) },
+      { logs: truncatedLogs, transaction: { message: { instructions: [depositIx] } } },
+      { logs: emittedBy(PROGRAM_ID, depositEvent(0xc0, 2)) }
+    ])
+    const leaves = await fetchV3Leaves(connection)
+    expect(leaves.map((l) => l.index)).toEqual([0, 1, 2])
+    expect(leaves[1].commitmentHex).toBe("b0".repeat(32))
   })
 
   it("ignores a byte-identical event emitted by a different program", async () => {

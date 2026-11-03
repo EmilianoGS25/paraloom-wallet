@@ -17,7 +17,9 @@ import {
   type Keypair
 } from "@solana/web3.js"
 
-import { confirmBySignatureStatus } from "./bridge"
+import { v3NoteCommitment } from "~lib/prover"
+
+import { base58Decode, confirmBySignatureStatus } from "./bridge"
 import {
   BRIDGE_STATE_SEED,
   BRIDGE_VAULT_SEED,
@@ -152,6 +154,61 @@ function startsWith(buf: Uint8Array, prefix: Uint8Array): boolean {
   return true
 }
 
+interface InstructionLike {
+  programId?: { toBase58(): string }
+  programIdIndex?: number
+  data: string | Uint8Array
+}
+
+interface MessageLike {
+  staticAccountKeys?: { toBase58(): string }[]
+  accountKeys?: { toBase58(): string }[]
+  compiledInstructions?: InstructionLike[]
+  instructions?: InstructionLike[]
+}
+
+/**
+ * Recover the deposit commitments from a transaction whose logs were truncated.
+ *
+ * Solana caps a transaction's logs at 10,000 bytes and replaces the tail with a
+ * single `Log truncated` line. A `deposit_note` after that line still commits
+ * its leaf on-chain but its DepositNoteEvent is gone, so the log-only rebuild
+ * loses a leaf and every later spend fails the contiguity/root check.
+ *
+ * The instruction data carries the same amount/pubkey/blinding the program used
+ * to build the commitment, so deposit leaves can be reconstructed without the
+ * event. Transact outputs are not recovered here; if one is missing the final
+ * contiguity check refuses the tree instead of folding a wrong root.
+ */
+async function depositCommitmentsFromTx(tx: {
+  transaction?: { message?: unknown }
+}): Promise<string[]> {
+  const msg = tx.transaction?.message as MessageLike | undefined
+  if (!msg) return []
+  const keys = msg.staticAccountKeys ?? msg.accountKeys ?? []
+  const ixs = msg.compiledInstructions ?? msg.instructions ?? []
+  const commitments: string[] = []
+  for (const ix of ixs) {
+    const pid =
+      ix.programId?.toBase58() ??
+      (typeof ix.programIdIndex === "number"
+        ? keys[ix.programIdIndex]?.toBase58()
+        : undefined)
+    if (pid !== PROGRAM_ID) continue
+    const data =
+      typeof ix.data === "string" ? base58Decode(ix.data) : Uint8Array.from(ix.data)
+    if (data.length < 80 || !startsWith(data, DEPOSIT_NOTE_DISCRIMINATOR)) continue
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+    const amount = view.getBigUint64(8, true)
+    const pubkeyHex = Buffer.from(data.slice(16, 48)).toString("hex")
+    const blindingHex = Buffer.from(data.slice(48, 80)).toString("hex")
+    commitments.push(
+      Buffer.from(await v3NoteCommitment(amount, pubkeyHex, blindingHex)).toString("hex")
+    )
+  }
+  return commitments
+}
+
 /// Rebuild the ordered v3 leaf list from the program's public event logs.
 ///
 /// DepositNoteEvent: depositor(32) amount(8) commitment(32)@40 leaf_index(8)@72.
@@ -181,6 +238,7 @@ export async function fetchV3Leaves(connection: Connection): Promise<V3Leaf[]> {
 
   const leaves: V3Leaf[] = []
   let transactLeafCursor: number | null = null
+  let nextLeafIndex = 0
 
   // Oldest first so transact outputs are numbered in append order. Each page is
   // newest-first and pages go newest→oldest, so the full list is newest-first;
@@ -209,12 +267,18 @@ export async function fetchV3Leaves(connection: Connection): Promise<V3Leaf[]> {
       )
     }
     const logs = tx.meta?.logMessages ?? []
-    for (const payload of eventPayloads(logs, PROGRAM_ID)) {
+    const truncated = logs.some((line) => line.includes("Log truncated"))
+    const payloads = eventPayloads(logs, PROGRAM_ID)
+    const eventCommitments = new Set<string>()
+    for (const payload of payloads) {
       if (startsWith(payload, DEPOSIT_NOTE_EVENT_DISCRIMINATOR)) {
         const body = payload.slice(8)
         const commitment = body.slice(40, 72)
+        const commitmentHex = Buffer.from(commitment).toString("hex")
         const leafIndex = Number(new DataView(body.buffer, body.byteOffset + 72, 8).getBigUint64(0, true))
-        leaves.push({ index: leafIndex, commitmentHex: Buffer.from(commitment).toString("hex") })
+        eventCommitments.add(commitmentHex)
+        leaves.push({ index: leafIndex, commitmentHex })
+        nextLeafIndex = Math.max(nextLeafIndex, leafIndex + 1)
         transactLeafCursor = Math.max(transactLeafCursor ?? 0, leafIndex + 1)
       } else if (startsWith(payload, DEPOSIT_NOTE_SPL_EVENT_DISCRIMINATOR)) {
         // SPL deposit (#779): same tree, one extra `mint` (32) field before the
@@ -223,10 +287,13 @@ export async function fetchV3Leaves(connection: Connection): Promise<V3Leaf[]> {
         // diverges from on-chain and every spend freezes.
         const body = payload.slice(8)
         const commitment = body.slice(72, 104)
+        const commitmentHex = Buffer.from(commitment).toString("hex")
         const leafIndex = Number(
           new DataView(body.buffer, body.byteOffset + 104, 8).getBigUint64(0, true)
         )
-        leaves.push({ index: leafIndex, commitmentHex: Buffer.from(commitment).toString("hex") })
+        eventCommitments.add(commitmentHex)
+        leaves.push({ index: leafIndex, commitmentHex })
+        nextLeafIndex = Math.max(nextLeafIndex, leafIndex + 1)
         transactLeafCursor = Math.max(transactLeafCursor ?? 0, leafIndex + 1)
       } else if (startsWith(payload, TRANSACT_EVENT_DISCRIMINATOR)) {
         const body = payload.slice(8)
@@ -236,6 +303,20 @@ export async function fetchV3Leaves(connection: Connection): Promise<V3Leaf[]> {
         leaves.push({ index: base, commitmentHex: Buffer.from(oc0).toString("hex") })
         leaves.push({ index: base + 1, commitmentHex: Buffer.from(oc1).toString("hex") })
         transactLeafCursor = base + 2
+        nextLeafIndex = Math.max(nextLeafIndex, base + 2)
+      }
+    }
+    if (truncated) {
+      // The log tail is gone, so any deposit after the truncation point has no
+      // DepositNoteEvent. Reconstruct those commitments from the instruction
+      // itself and place them at the next append position. A truncated transact
+      // output is not recoverable here; the contiguity check below then refuses
+      // the incomplete tree instead of folding a wrong root.
+      for (const commitmentHex of await depositCommitmentsFromTx(tx)) {
+        if (eventCommitments.has(commitmentHex)) continue
+        leaves.push({ index: nextLeafIndex, commitmentHex })
+        transactLeafCursor = Math.max(transactLeafCursor ?? 0, nextLeafIndex + 1)
+        nextLeafIndex++
       }
     }
   }
